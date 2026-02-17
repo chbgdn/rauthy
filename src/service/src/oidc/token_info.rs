@@ -4,6 +4,8 @@ use rauthy_api_types::oidc::TokenInfo;
 use rauthy_common::utils::base64_decode_buf;
 use rauthy_data::entity::clients::Client;
 use rauthy_data::entity::issued_tokens::IssuedToken;
+use rauthy_data::entity::users::User;
+use rauthy_data::entity::users_values::UserValues;
 use rauthy_data::rauthy_config::RauthyConfig;
 use rauthy_error::{ErrorResponse, ErrorResponseType};
 use rauthy_jwt::claims::{JwtAccessClaims, JwtCommonClaims, JwtTokenType};
@@ -45,6 +47,60 @@ pub async fn get_token_info(
     }
     let client_id = claims.azp.to_string();
 
+    // Matrix MSC3861 / MSC2967 Compatibility Layer
+    //
+    // Synapse delegates authentication to the OIDC provider (MSC3861).
+    // To correctly map an OIDC session to a Matrix user and device, Synapse
+    // expects explicit `username` and `device_id` claims in the introspection
+    // response.
+    //
+    // - `username`: Mapped to the Matrix localpart. We try to resolve it via:
+    //    1. `preferred_username`
+    //    2. The localpart of the `email` (everything before '@')
+    //    3. Fallback to `sub` to ensure the claim is never empty if the token is active.
+    // - `device_id`: Extracted from the granted scopes according to MSC2967
+    //   (supporting both stable and unstable prefixes).
+    let (username, device_id) = if RauthyConfig::get().vars.matrix.msc3861_enable {
+        let uname = match claims.sub.as_deref() {
+            Some(sub) => {
+                let mut resolved_name = None;
+
+                if let Ok(Some(user_values)) = UserValues::find(sub).await {
+                    resolved_name = user_values.preferred_username.filter(|s| !s.is_empty());
+                }
+
+                if resolved_name.is_none() {
+                    if let Ok(user) = User::find(sub.to_string()).await {
+                        resolved_name = user
+                            .email
+                            .split('@')
+                            .next()
+                            .filter(|s| !s.is_empty())
+                            .map(String::from);
+                    }
+                }
+
+                Some(resolved_name.unwrap_or_else(|| sub.to_string()))
+            }
+            None => None,
+        };
+
+        let did = claims.scope.as_deref().and_then(|scope_str| {
+            scope_str
+                .split_whitespace()
+                .find_map(|scp| {
+                    scp.strip_prefix("urn:matrix:client:device:").or_else(|| {
+                        scp.strip_prefix("urn:matrix:org.matrix.msc2967.client:device:")
+                    })
+                })
+                .map(String::from)
+        });
+
+        (uname, did)
+    } else {
+        (None, None)
+    };
+
     // serialize token already before checking client to be able to re-use `buf`
     let info = serde_json::to_string(&TokenInfo {
         active: true,
@@ -56,6 +112,8 @@ pub async fn get_token_info(
         nbf: Some(claims.nbf),
         exp: Some(claims.exp),
         cnf: claims.cnf,
+        username,
+        device_id,
     })?;
 
     buf.clear();

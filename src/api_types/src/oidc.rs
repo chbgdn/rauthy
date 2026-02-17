@@ -450,4 +450,8 @@ pub struct TokenInfo<'a> {
     pub exp: Option<i64>,
     #[serde(borrow, skip_serializing_if = "Option::is_none")]
     pub cnf: Option<JktClaim<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
 }
